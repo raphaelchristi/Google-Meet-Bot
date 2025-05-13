@@ -154,3 +154,4 @@ class SpeechToText:
         print(f"Key Points: {summary['key_points']}")
         print(f"Action Items: {summary['action_items']}")
         print(f"Sentiment: {summary['sentiment']}")
+
