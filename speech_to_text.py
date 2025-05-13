@@ -1,21 +1,33 @@
-from openai import OpenAI
+import requests
 import json
 import os
 import subprocess
 import tempfile
 import datetime
 from dotenv import load_dotenv
+from google import genai
+from google.generativeai import types
 
 load_dotenv()
 
 class SpeechToText:
     def __init__(self):
-        self.client = OpenAI(
-            api_key=os.getenv("OPENAI_API_KEY")
-        )
-        self.MAX_AUDIO_SIZE_BYTES = int(os.getenv('MAX_AUDIO_SIZE_BYTES', 20 * 1024 * 1024))
-        self.GPT_MODEL = os.getenv('GPT_MODEL', 'gpt-4')
-        self.WHISPER_MODEL = os.getenv('WHISPER_MODEL', 'whisper-1')
+        self.elevenlabs_api_key = os.getenv("ELEVENLABS_API_KEY")
+        self.gemini_api_key = os.getenv("GEMINI_API_KEY")
+        
+        if not self.elevenlabs_api_key:
+            raise ValueError("ELEVENLABS_API_KEY não configurada nas variáveis de ambiente.")
+        if not self.gemini_api_key:
+            raise ValueError("GEMINI_API_KEY não configurada nas variáveis de ambiente.")
+
+        genai.configure(api_key=self.gemini_api_key)
+        
+        self.gemini_model_name = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+        self.gemini_client = genai.GenerativeModel(self.gemini_model_name)
+        
+        self.elevenlabs_scribe_model_id = os.getenv("ELEVENLABS_SCRIBE_MODEL_ID", "scribe_v1")
+        
+        self.MAX_AUDIO_SIZE_BYTES = int(os.getenv('MAX_AUDIO_SIZE_BYTES', 20 * 1024 * 1024)) # Mantido, mas a ElevenLabs tem seus próprios limites (1GB para arquivo, 2GB para URL)
 
     def get_file_size(self, file_path):
         return os.path.getsize(file_path)
@@ -25,101 +37,92 @@ class SpeechToText:
         return float(result.stdout)
 
     def resize_audio_if_needed(self, audio_file_path):
+        # Esta função pode precisar de ajustes ou ser removida dependendo dos limites e tratamento da ElevenLabs
+        # Por enquanto, vamos mantê-la, mas ciente que a ElevenLabs lida com arquivos grandes.
         audio_size = self.get_file_size(audio_file_path)
-        if audio_size > self.MAX_AUDIO_SIZE_BYTES:
-            current_duration = self.get_audio_duration(audio_file_path)
-            target_duration = current_duration * self.MAX_AUDIO_SIZE_BYTES / audio_size
-            
-            temp_dir = tempfile.mkdtemp()
-            print(f"Compressed audio will be stored in {temp_dir}")
-            
-            compressed_audio_path = os.path.join(temp_dir, f'compressed_audio_{datetime.datetime.now().strftime("%Y%m%d%H%M%S")}.wav')
-            
-            subprocess.run(['ffmpeg', '-i', audio_file_path, '-ss', '0', '-t', str(target_duration), compressed_audio_path])
-            
-            return compressed_audio_path
+        if audio_size > self.MAX_AUDIO_SIZE_BYTES: # Comparando com um limite antigo, ElevenLabs suporta mais
+            print(f"Aviso: O áudio ({audio_size} bytes) excede MAX_AUDIO_SIZE_BYTES ({self.MAX_AUDIO_SIZE_BYTES} bytes) definido localmente, mas a ElevenLabs pode suportá-lo.")
+            # Não vamos redimensionar automaticamente por enquanto, pois a ElevenLabs tem limites maiores.
+            # Se o envio falhar devido ao tamanho, esta lógica pode ser reativada ou ajustada.
+            # current_duration = self.get_audio_duration(audio_file_path)
+            # target_duration = current_duration * self.MAX_AUDIO_SIZE_BYTES / audio_size
+            # temp_dir = tempfile.mkdtemp()
+            # print(f"Compressed audio will be stored in {temp_dir}")
+            # compressed_audio_path = os.path.join(temp_dir, f'compressed_audio_{datetime.datetime.now().strftime("%Y%m%d%H%M%S")}.wav')
+            # subprocess.run(['ffmpeg', '-i', audio_file_path, '-ss', '0', '-t', str(target_duration), compressed_audio_path])
+            # return compressed_audio_path
         return audio_file_path
 
     def transcribe_audio(self, audio_file_path):
+        url = "https://api.elevenlabs.io/v1/speech-to-text"
+        headers = {
+            "xi-api-key": self.elevenlabs_api_key
+        }
+        data = {
+            "model_id": self.elevenlabs_scribe_model_id
+            # Outros parâmetros como language_code, num_speakers podem ser adicionados aqui se necessário
+        }
+        
         with open(audio_file_path, 'rb') as audio_file:
-            transcript = self.client.audio.translations.create(
-                file=audio_file,
-                model=self.WHISPER_MODEL,
-            )
-            print("Transcribe: Done")
-            return transcript.text
+            files = {
+                'file': (os.path.basename(audio_file_path), audio_file, 'audio/mpeg') # Tentar inferir ou usar um tipo comum
+            }
+            try:
+                response = requests.post(url, headers=headers, data=data, files=files)
+                response.raise_for_status()  # Levanta um erro para códigos de status HTTP ruins (4xx ou 5xx)
+                transcript_data = response.json()
+                print("Transcribe (ElevenLabs): Done")
+                # A documentação indica que o texto completo está em transcript_data["text"]
+                return transcript_data.get("text", "") 
+            except requests.exceptions.RequestException as e:
+                print(f"Erro na transcrição com ElevenLabs: {e}")
+                if hasattr(e, 'response') and e.response is not None:
+                    print(f"Detalhes do erro: {e.response.text}")
+                return None # Retornar None ou levantar uma exceção mais específica
+            except json.JSONDecodeError:
+                print(f"Erro ao decodificar JSON da resposta da ElevenLabs: {response.text}")
+                return None
+
+    def _generate_gemini_content(self, system_prompt, user_transcription):
+        prompt_parts = [
+            types.Part.from_text(f"{system_prompt}\n\nTexto para analisar:\n{user_transcription}")
+        ]
+        contents = [types.Content(role="user", parts=prompt_parts)]
+        
+        try:
+            response = self.gemini_client.generate_content(contents=contents)
+            return response.text
+        except Exception as e:
+            print(f"Erro ao gerar conteúdo com Gemini: {e}")
+            # Você pode querer verificar response.prompt_feedback aqui também
+            # if hasattr(response, 'prompt_feedback') and response.prompt_feedback:
+            #     print(f"Prompt Feedback: {response.prompt_feedback}")
+            return f"Erro ao gerar conteúdo: {e}"
+
 
     def abstract_summary_extraction(self, transcription):
-        response = self.client.chat.completions.create(
-            model=self.GPT_MODEL,
-            temperature=0,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are a highly skilled AI trained in language comprehension and summarization. I would like you to read the following text and summarize it into a concise abstract paragraph. Aim to retain the most important points, providing a coherent and readable summary that could help a person understand the main points of the discussion without needing to read the entire text. Please avoid unnecessary details or tangential points."
-                },
-                {
-                    "role": "user",
-                    "content": transcription
-                }
-            ]
-        )
-        print("Summary: Done")
-        return response.choices[0].message.content
+        system_prompt = "Você é uma IA altamente qualificada, treinada em compreensão de linguagem e sumarização. Gostaria que você lesse o texto a seguir e o resumisse em um parágrafo abstrato conciso. Procure reter os pontos mais importantes, fornecendo um resumo coerente e legível que possa ajudar uma pessoa a entender os pontos principais da discussão sem precisar ler o texto inteiro. Evite detalhes desnecessários ou pontos tangenciais."
+        summary = self._generate_gemini_content(system_prompt, transcription)
+        print("Summary (Gemini): Done")
+        return summary
 
     def key_points_extraction(self, transcription):
-        response = self.client.chat.completions.create(
-            model=self.GPT_MODEL,
-            temperature=0,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are a proficient AI with a specialty in distilling information into key points. Based on the following text, identify and list the main points that were discussed or brought up. These should be the most important ideas, findings, or topics that are crucial to the essence of the discussion. Your goal is to provide a list that someone could read to quickly understand what was talked about."
-                },
-                {
-                    "role": "user",
-                    "content": transcription
-                }
-            ]
-        )
-        print("Key Points: Done")
-        return response.choices[0].message.content
+        system_prompt = "Você é uma IA proficiente com especialidade em destilar informações em pontos-chave. Com base no texto a seguir, identifique e liste os principais pontos que foram discutidos ou levantados. Devem ser as ideias, descobertas ou tópicos mais importantes que são cruciais para a essência da discussão. Seu objetivo é fornecer uma lista que alguém possa ler para entender rapidamente sobre o que foi falado."
+        key_points = self._generate_gemini_content(system_prompt, transcription)
+        print("Key Points (Gemini): Done")
+        return key_points
 
     def action_item_extraction(self, transcription):
-        response = self.client.chat.completions.create(
-            model=self.GPT_MODEL,
-            temperature=0,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are an AI expert in analyzing conversations and extracting action items. Please review the text and identify any tasks, assignments, or actions that were agreed upon or mentioned as needing to be done. These could be tasks assigned to specific individuals, or general actions that the group has decided to take. Please list these action items clearly and concisely."
-                },
-                {
-                    "role": "user",
-                    "content": transcription
-                }
-            ]
-        )
-        print("Action Items: Done")
-        return response.choices[0].message.content
+        system_prompt = "Você é um especialista em IA em analisar conversas e extrair itens de ação. Revise o texto e identifique quaisquer tarefas, atribuições ou ações que foram acordadas ou mencionadas como necessitando ser feitas. Podem ser tarefas atribuídas a indivíduos específicos ou ações gerais que o grupo decidiu tomar. Liste esses itens de ação de forma clara e concisa."
+        action_items = self._generate_gemini_content(system_prompt, transcription)
+        print("Action Items (Gemini): Done")
+        return action_items
 
     def sentiment_analysis(self, transcription):
-        response = self.client.chat.completions.create(
-            model=self.GPT_MODEL,
-            temperature=0,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "As an AI with expertise in language and emotion analysis, your task is to analyze the sentiment of the following text. Please consider the overall tone of the discussion, the emotion conveyed by the language used, and the context in which words and phrases are used. Indicate whether the sentiment is generally positive, negative, or neutral, and provide brief explanations for your analysis where possible."
-                },
-                {
-                    "role": "user",
-                    "content": transcription
-                }
-            ]
-        )
-        print("Sentiment: Done")
-        return response.choices[0].message.content
+        system_prompt = "Como uma IA com experiência em análise de linguagem e emoção, sua tarefa é analisar o sentimento do texto a seguir. Considere o tom geral da discussão, a emoção transmitida pela linguagem utilizada e o contexto em que palavras e frases são usadas. Indique se o sentimento é geralmente positivo, negativo ou neutro e forneça breves explicações para sua análise, quando possível."
+        sentiment = self._generate_gemini_content(system_prompt, transcription)
+        print("Sentiment (Gemini): Done")
+        return sentiment
 
     def meeting_minutes(self, transcription):
         abstract_summary = self.abstract_summary_extraction(transcription)
@@ -151,3 +154,4 @@ class SpeechToText:
         print(f"Key Points: {summary['key_points']}")
         print(f"Action Items: {summary['action_items']}")
         print(f"Sentiment: {summary['sentiment']}")
+
